@@ -25,6 +25,7 @@ from .nn.les import (
     LatentChargeReadout,
     LatentEwaldSum,
     LESForceStressOutput,
+    NeutralizeCharge,
 )
 from .nn.linear import AtomReduce, FCN_e3nn, IrrepsLinear
 from .nn.node_embedding import OnehotEmbedding
@@ -618,6 +619,22 @@ def build_E3_equivariant_model(
             hidden_channels=les_cfg.get('hidden_channels', None),
             zero_init=les_cfg.get('zero_init', False),
         )
+        # Optional: charge-neutralization (Σq = 0 per graph).
+        #   'none'  → no module added (default; current behavior)
+        #   'shift' → uniform mean subtraction
+        #   'fukui' → softplus(f)-weighted excess redistribution; needs f readout
+        _neutral = les_cfg.get('neutralize_mode', 'none')
+        if _neutral == 'fukui':
+            layers['les_fukui_readout'] = LatentChargeReadout(
+                irreps_in=irreps_x,  # type: ignore
+                data_key_in=KEY.NODE_FEATURE,
+                data_key_out=KEY.LES_F,
+                n_charges=1,
+                hidden_channels=les_cfg.get('fukui_hidden_channels', None),
+                zero_init=les_cfg.get('fukui_zero_init', False),
+            )
+        if _neutral != 'none':
+            layers['les_neutralize'] = NeutralizeCharge(mode=_neutral)
 
     layers.update(init_feature_reduce(config, irreps_x))  # type: ignore
 

@@ -84,7 +84,9 @@ def train_v2(config: Dict[str, Any], working_dir: str) -> None:
     if config.get(KEY.USE_LES, False) and config.get(
         KEY.LES_CONFIG, {}
     ).get('freeze_sr', False):
-        les_module_names = {'les_charge_readout', 'les_lr_energy'}
+        les_module_names = {
+            'les_charge_readout', 'les_lr_energy', 'les_fukui_readout',
+        }
         for name, param in model.named_parameters():
             if name.split('.')[0] not in les_module_names:
                 param.requires_grad_(False)
