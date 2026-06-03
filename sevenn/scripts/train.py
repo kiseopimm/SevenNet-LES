@@ -86,6 +86,7 @@ def train_v2(config: Dict[str, Any], working_dir: str) -> None:
     ).get('freeze_sr', False):
         les_module_names = {
             'les_charge_readout', 'les_lr_energy', 'les_fukui_readout',
+            'les_dipole_correction',
         }
         for name, param in model.named_parameters():
             if name.split('.')[0] not in les_module_names:

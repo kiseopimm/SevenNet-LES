@@ -344,6 +344,110 @@ class AddLREnergy(nn.Module):
         return data
 
 
+class DipoleCorrection(nn.Module):
+    """
+    Bengtsson-style slab dipole correction driven by LES latent charges.
+
+    Per graph:
+        μ_axis = Σ_i q_i · r_{i,axis}            (e·Å, summed over channels)
+        E_dip  = sign · μ² / (2 ε₀ V_cell)        (eV)
+
+    With ``sign = -1`` (default) and raw DFT data containing the PBC dipole-
+    image artifact, this matches the artifact baked into the data, so that the
+    loss compares like-with-like. This is the in-model counterpart of
+    ``correct_dataset.py``'s dataset-side ``+μ²/(2ε₀V)`` correction:
+
+        (A) dataset E += +μ²/(2ε₀V)              model has no DipoleCorrection
+        (B) dataset E unchanged                  model adds  -μ²/(2ε₀V) here
+
+    Use (A) XOR (B) — applying both is double counting.
+
+    Forces are produced automatically by ``LESForceStressOutput``:
+      - direct ∂E_dip/∂pos contributes to F via the position grad path
+      - charge-readout ∂E_dip/∂edge_vec contributes via the edge grad path
+
+    Stress contribution from the explicit z-dependence is **not** captured
+    (we don't tap into ``LES_STRAIN``); only the q-path edge virial flows
+    through. For slab systems this is usually acceptable since stress is
+    typically not used in the loss for dipole-laden geometries.
+
+    Args:
+        axis:  cartesian axis (0|1|2) along which the slab dipole lives.
+               default 2 (z).
+        sign:  ±1 multiplier. -1 reproduces raw DFT (default, matches (B)).
+        eps0:  vacuum permittivity in e²/(eV·Å); default 5.5263499562e-3.
+        data_key_q: latent charges input (N, n_charges).
+        data_key_e: PRED_TOTAL_ENERGY (in-place add).
+    """
+
+    EPS0_AU: float = 5.5263499562e-3
+
+    def __init__(
+        self,
+        axis: int = 2,
+        sign: float = -1.0,
+        eps0: Optional[float] = None,
+        data_key_q: str = KEY.LES_Q,
+        data_key_e: str = KEY.PRED_TOTAL_ENERGY,
+    ):
+        super().__init__()
+        if axis not in (0, 1, 2):
+            raise ValueError(f'axis must be 0|1|2; got {axis}')
+        if sign not in (-1.0, 1.0):
+            # not strictly enforced, but warn-ish via assert
+            pass
+        self.axis = int(axis)
+        self.sign = float(sign)
+        self.eps0 = float(eps0) if eps0 is not None else self.EPS0_AU
+        self.key_q = data_key_q
+        self.key_e = data_key_e
+        self._is_batch_data = True  # set by AtomGraphSequential.set_is_batch_data
+
+    def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+        q = data[self.key_q]          # (N, n_charges)
+        pos = data[KEY.POS]           # (N, 3)
+
+        # Make sure positions track gradients (LESForceStressOutput will read
+        # d(E)/d(pos) — needed even if les_lr_energy already enabled it).
+        if torch.is_grad_enabled() and pos.is_leaf and not pos.requires_grad:
+            pos.requires_grad_(True)
+
+        if self._is_batch_data:
+            batch = data[KEY.BATCH].long()
+            n_graphs = int(batch.max().item()) + 1
+        else:
+            batch = torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
+            n_graphs = 1
+
+        n_ch = q.shape[1]
+        r_axis = pos[:, self.axis]                       # (N,)
+        qz = q * r_axis.unsqueeze(-1)                    # (N, n_ch)
+        mu = torch.zeros(n_graphs, n_ch, device=q.device, dtype=q.dtype)
+        mu.scatter_add_(
+            0, batch.unsqueeze(-1).expand(-1, n_ch), qz
+        )                                                # (n_graphs, n_ch)
+
+        # Cell volume per graph
+        if KEY.CELL in data:
+            cell = data[KEY.CELL].view(-1, 3, 3)
+            V = torch.det(cell).abs()                    # (n_graphs,)
+        else:
+            V = data[KEY.CELL_VOLUME]
+
+        e_dip_per_graph = (
+            self.sign
+            * (mu * mu).sum(dim=-1)
+            / (2.0 * self.eps0 * V.clamp(min=1e-12))
+        )                                                # (n_graphs,)
+
+        e_tot = data[self.key_e]
+        if self._is_batch_data:
+            data[self.key_e] = e_tot + e_dip_per_graph
+        else:
+            data[self.key_e] = e_tot + e_dip_per_graph.squeeze()
+        return data
+
+
 class LESForceStressOutput(nn.Module):
     """
     Force and stress output for LES models. Replaces ForceStressOutputFromEdge.

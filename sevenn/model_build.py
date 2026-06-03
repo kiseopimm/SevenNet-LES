@@ -22,6 +22,7 @@ from .nn.force_output import ForceStressOutputFromEdge
 from .nn.interaction_blocks import NequIP_interaction_block
 from .nn.les import (
     AddLREnergy,
+    DipoleCorrection,
     LatentChargeReadout,
     LatentEwaldSum,
     LESForceStressOutput,
@@ -639,30 +640,40 @@ def build_E3_equivariant_model(
     layers.update(init_feature_reduce(config, irreps_x))  # type: ignore
 
     if config.get(KEY.USE_LES, False):
-        layers.update(
-            {
-                'rescale_atomic_energy': init_shift_scale(config),
-                # SR energy: sum of per-atom (local) energies
-                'reduce_sr_energy': AtomReduce(
-                    data_key_in=KEY.ATOMIC_ENERGY,
-                    data_key_out=KEY.SR_ENERGY,
-                ),
-                # LR energy: Ewald summation on latent charges
-                'les_lr_energy': LatentEwaldSum(
-                    les_args=les_cfg.get('les_args', {'use_atomwise': False}),
-                    data_key_in=KEY.LES_Q,
-                    data_key_out=KEY.LR_ENERGY,
-                    compute_bec=les_cfg.get('compute_bec', False),
-                    bec_output_index=les_cfg.get('bec_output_index', None),
-                ),
-                # Total = SR + LR
-                'add_lr_to_total': AddLREnergy(
-                    key_sr=KEY.SR_ENERGY,
-                    key_lr=KEY.LR_ENERGY,
-                    data_key_out=KEY.PRED_TOTAL_ENERGY,
-                ),
-            }
-        )
+        _les_block = OrderedDict({
+            'rescale_atomic_energy': init_shift_scale(config),
+            # SR energy: sum of per-atom (local) energies
+            'reduce_sr_energy': AtomReduce(
+                data_key_in=KEY.ATOMIC_ENERGY,
+                data_key_out=KEY.SR_ENERGY,
+            ),
+            # LR energy: Ewald summation on latent charges
+            'les_lr_energy': LatentEwaldSum(
+                les_args=les_cfg.get('les_args', {'use_atomwise': False}),
+                data_key_in=KEY.LES_Q,
+                data_key_out=KEY.LR_ENERGY,
+                compute_bec=les_cfg.get('compute_bec', False),
+                bec_output_index=les_cfg.get('bec_output_index', None),
+            ),
+            # Total = SR + LR
+            'add_lr_to_total': AddLREnergy(
+                key_sr=KEY.SR_ENERGY,
+                key_lr=KEY.LR_ENERGY,
+                data_key_out=KEY.PRED_TOTAL_ENERGY,
+            ),
+        })
+        # Optional: Bengtsson-style PBC dipole correction using LES latent q.
+        # Adds  sign * μ²/(2 ε₀ V) per graph to PRED_TOTAL_ENERGY.
+        # Mutually exclusive with dataset-side correction (correct_dataset.py).
+        _dipcorr = les_cfg.get('dipole_correction', False)
+        if _dipcorr:
+            _dip_cfg = les_cfg.get('dipole_correction_config', {}) or {}
+            _les_block['les_dipole_correction'] = DipoleCorrection(
+                axis=_dip_cfg.get('axis', 2),
+                sign=_dip_cfg.get('sign', -1.0),
+                eps0=_dip_cfg.get('eps0', None),
+            )
+        layers.update(_les_block)
     else:
         layers.update(
             {
